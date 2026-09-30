@@ -1,0 +1,4 @@
+kafka-python==2.3.2
+# Stay below 4: GNS3 IOS images tend to offer only old SSH algorithms,
+# so check legacy-router compatibility before moving to a new major.
+paramiko<4

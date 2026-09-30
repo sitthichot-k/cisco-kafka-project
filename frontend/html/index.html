@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cisco Command Center</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Cisco Command Center</h1>
+    <p class="flow">Frontend &rarr; Backend &rarr; Kafka &rarr; Worker (paramiko) &rarr; GNS3 routers</p>
+  </header>
+
+  <main>
+    <section class="card" id="compose">
+      <h2>New job</h2>
+      <form id="job-form">
+        <label>Router
+          <select id="router" required></select>
+        </label>
+
+        <fieldset class="modes">
+          <legend>Mode</legend>
+          <label><input type="radio" name="mode" value="exec" checked> Exec (show)</label>
+          <label><input type="radio" name="mode" value="config"> Config (configure terminal)</label>
+        </fieldset>
+
+        <div class="presets" id="presets"></div>
+
+        <label>Commands <span class="hint">one per line</span>
+          <textarea id="commands" rows="7" spellcheck="false" required>show ip interface brief</textarea>
+        </label>
+
+        <button type="submit" id="submit">Send to Kafka</button>
+        <p id="form-message" class="message" role="status"></p>
+      </form>
+    </section>
+
+    <section class="card" id="history">
+      <div class="history-head">
+        <h2>Jobs</h2>
+        <span id="conn" class="conn">connecting&hellip;</span>
+      </div>
+      <ul id="job-list" class="job-list"></ul>
+    </section>
+
+    <section class="card" id="detail">
+      <h2 id="detail-title">Output</h2>
+      <div id="detail-meta" class="meta"></div>
+      <pre id="detail-output" class="output">Select a job to see its output.</pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
