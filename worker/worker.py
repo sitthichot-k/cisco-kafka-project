@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.errors import NoBrokersAvailable
 
-from cisco_ssh import RouterError, find_router, run_commands
+from cisco_ssh import RouterError, router_settings, run_commands
+from discovery import discover
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:29092")
 COMMAND_TOPIC = os.environ.get("COMMAND_TOPIC", "cisco-commands")
@@ -48,6 +49,7 @@ def handle(job, producer):
             "router": router_name,
             "mode": job.get("mode"),
             "commands": job.get("commands"),
+            "host": job.get("host"),
             "submitted_at": job.get("submitted_at"),
             "worker": WORKER_NAME,
             **fields,
@@ -58,9 +60,15 @@ def handle(job, producer):
     log.info("job %s -> %s (%s): %s", job.get("job_id"), router_name, job.get("mode"), job.get("commands"))
     publish(status="running", started_at=now_iso())
     try:
-        router = find_router(router_name)
-        output = run_commands(router, job.get("commands") or [], job.get("mode", "exec"))
-        publish(status="success", output=output, finished_at=now_iso())
+        if job.get("mode") == "discover":
+            routers, report = discover()
+            publish(status="success", routers=routers, output="\n".join(report), finished_at=now_iso())
+        else:
+            router = router_settings(router_name, job.get("host"))
+            output = run_commands(
+                router, job.get("commands") or [], job.get("mode", "exec"), expected_hostname=router_name
+            )
+            publish(status="success", output=output, finished_at=now_iso())
         log.info("job %s succeeded", job.get("job_id"))
     except RouterError as exc:
         publish(status="failed", error=str(exc), finished_at=now_iso())

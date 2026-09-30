@@ -16,9 +16,12 @@
     <section class="card" id="compose">
       <h2>New job</h2>
       <form id="job-form">
-        <label>Router
+        <label for="router">Router</label>
+        <div class="router-row">
           <select id="router" required></select>
-        </label>
+          <button type="button" id="scan" class="secondary">Scan network</button>
+        </div>
+        <p id="scan-status" class="scan-status"></p>
 
         <fieldset class="modes">
           <legend>Mode</legend>

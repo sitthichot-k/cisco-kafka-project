@@ -4,16 +4,9 @@
     "password": "cisco",
     "port": 22
   },
-  "routers": [
-    {
-      "name": "R1",
-      "host": "192.168.122.101",
-      "description": "GNS3 R1 (fa0/0 via DHCP - replace host with the IP from 'show ip interface brief')"
-    },
-    {
-      "name": "R2",
-      "host": "192.168.122.102",
-      "description": "GNS3 R2 (fa0/0 via DHCP - replace host with the IP from 'show ip interface brief')"
-    }
-  ]
+  "discovery": {
+    "subnets": "auto",
+    "interval_seconds": 300
+  },
+  "routers": []
 }

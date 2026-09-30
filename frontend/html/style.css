@@ -160,3 +160,23 @@ button[type="submit"]:disabled { opacity: 0.6; cursor: wait; }
   overflow: auto;
 }
 .output.error { color: #ffb4a8; }
+
+label[for="router"] { margin-bottom: 0; }
+.router-row { display: flex; gap: 8px; align-items: stretch; margin-top: 6px; }
+.router-row select { margin-top: 0; flex: 1; min-width: 0; }
+
+button.secondary {
+  padding: 0 12px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button.secondary:disabled { opacity: 0.5; cursor: wait; }
+
+.scan-status { margin: 6px 0 12px; font-size: 0.8rem; color: var(--muted); min-height: 1em; }
+.scan-status.error { color: var(--bad); }

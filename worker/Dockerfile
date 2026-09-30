@@ -6,6 +6,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY cisco_ssh.py worker.py ./
+COPY cisco_ssh.py discovery.py worker.py ./
 
 CMD ["python", "worker.py"]

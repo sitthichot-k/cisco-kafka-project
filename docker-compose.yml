@@ -29,8 +29,12 @@ services:
 
   worker:
     build: ./worker
+    # Host networking: the worker sees the VM's real interfaces, so router
+    # discovery can scan the VM's subnets, and reaches the routers exactly
+    # like the VM itself does. Kafka is then reached on its host port.
+    network_mode: host
     environment:
-      KAFKA_BOOTSTRAP: kafka:29092
+      KAFKA_BOOTSTRAP: localhost:7092
       COMMAND_TOPIC: cisco-commands
       RESULT_TOPIC: cisco-results
       ROUTERS_FILE: /config/routers.json

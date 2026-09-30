@@ -46,18 +46,44 @@ function renderPresets() {
   }
 }
 
+function describeScan(scan) {
+  if (!scan) return "No scan yet.";
+  if (scan.status === "queued" || scan.status === "running") return "Scanning the network for routers…";
+  if (scan.status === "failed") return `Last scan failed: ${scan.error || "see job output"}`;
+  return `Last scan ${formatTime(scan.finished_at)}`;
+}
+
 async function loadRouters() {
   const select = el("router");
   try {
-    const routers = await api("/routers");
-    select.replaceChildren(...routers.map((r) => {
-      const opt = document.createElement("option");
-      opt.value = r.name;
-      opt.textContent = `${r.name} (${r.host})`;
-      return opt;
-    }));
+    const { routers, last_scan: scan } = await api("/routers");
+    const current = select.value;
+    // Only rebuild when the list changed, so an open dropdown is not reset.
+    const signature = JSON.stringify(routers);
+    if (select.dataset.signature !== signature) {
+      select.dataset.signature = signature;
+      if (routers.length) {
+        select.replaceChildren(...routers.map((r) => {
+          const opt = document.createElement("option");
+          opt.value = r.name;
+          opt.textContent = `${r.name} (${r.host})${r.source === "config" ? " · config" : ""}`;
+          return opt;
+        }));
+        if (routers.some((r) => r.name === current)) select.value = current;
+      } else {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "No routers found yet";
+        select.replaceChildren(opt);
+      }
+    }
+    const scanning = scan && (scan.status === "queued" || scan.status === "running");
+    el("scan").disabled = Boolean(scanning);
+    el("scan-status").textContent = describeScan(scan);
+    el("scan-status").classList.toggle("error", scan?.status === "failed");
   } catch (err) {
-    showMessage(`Could not load routers: ${err.message}`, true);
+    el("scan-status").textContent = `Could not load routers: ${err.message}`;
+    el("scan-status").classList.add("error");
   }
 }
 
@@ -91,7 +117,9 @@ function renderJobs(jobs) {
 
     const title = document.createElement("span");
     title.className = "job-title";
-    title.textContent = `${job.router} · ${(job.commands || [])[0] || ""}${(job.commands || []).length > 1 ? " …" : ""}`;
+    title.textContent = job.mode === "discover"
+      ? "Network scan"
+      : `${job.router} · ${(job.commands || [])[0] || ""}${(job.commands || []).length > 1 ? " …" : ""}`;
 
     const time = document.createElement("span");
     time.className = "job-time";
@@ -106,9 +134,10 @@ function renderJobs(jobs) {
 }
 
 function renderDetail(job) {
-  el("detail-title").textContent = `Output · ${job.router}`;
+  el("detail-title").textContent = job.mode === "discover" ? "Output · Network scan" : `Output · ${job.router}`;
   const meta = [
     `job ${job.job_id}`,
+    job.host ? `host ${job.host}` : null,
     `mode ${job.mode}`,
     `status ${job.status}`,
     job.worker ? `worker ${job.worker}` : null,
@@ -126,6 +155,7 @@ function renderDetail(job) {
 }
 
 async function poll() {
+  loadRouters();
   try {
     renderJobs(await api("/jobs"));
     el("conn").textContent = "live";
@@ -159,10 +189,22 @@ el("job-form").addEventListener("submit", async (event) => {
   }
 });
 
+el("scan").addEventListener("click", async () => {
+  el("scan").disabled = true;
+  try {
+    const job = await api("/discover", { method: "POST" });
+    selectedJobId = job.job_id;
+    await poll();
+  } catch (err) {
+    el("scan-status").textContent = err.message;
+    el("scan-status").classList.add("error");
+    el("scan").disabled = false;
+  }
+});
+
 document.querySelectorAll('input[name="mode"]').forEach((radio) =>
   radio.addEventListener("change", renderPresets));
 
 renderPresets();
-loadRouters();
 poll();
 setInterval(poll, POLL_MS);

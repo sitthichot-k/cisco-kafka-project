@@ -17,13 +17,18 @@ the `cisco-results` topic is an addition that lets the web page show command
 output. The worker never calls the backend directly; Kafka is the only link
 between them.
 
+Router IPs are **not configured anywhere**. The routers get their addresses
+from DHCP, so every machine running this lab ends up with different IPs. The
+worker finds the routers itself (see [Router discovery](#router-discovery)),
+so the project runs after `git clone` without editing any file.
+
 ## Folder structure
 
 ```
 .
 ├── docker-compose.yml     # whole stack
 ├── config/
-│   └── routers.json       # router names, IPs, credentials (shared by backend + worker)
+│   └── routers.json       # SSH credentials, discovery settings, optional manual IPs
 ├── frontend/              # static HTML/JS served by nginx; nginx proxies /api to backend
 │   ├── Dockerfile
 │   ├── nginx.conf
@@ -36,6 +41,7 @@ between them.
     ├── Dockerfile
     ├── requirements.txt
     ├── worker.py          # Kafka loop, publishes status/output
+    ├── discovery.py       # finds routers by hostname on the VM's subnets
     └── cisco_ssh.py       # SSH session to IOS (enable, terminal length 0, config mode)
 ```
 
@@ -47,14 +53,52 @@ between them.
 | backend    | http://<vm-ip>:7001/api/...  | REST API (also reachable via frontend)    |
 | kafka-ui   | http://<vm-ip>:7080          | Browse topics and messages                |
 | kafka      | localhost:7092 (VM only)     | Broker listener for tools on the VM       |
-| worker     | (none)                       | Runs jobs; scale with `--scale worker=N`  |
+| worker     | (none, host network)         | Runs jobs; scale with `--scale worker=N`  |
 | kafka-init | (runs once, then exits)      | Creates the two topics with 3 partitions  |
+
+## Router discovery
+
+1. A few seconds after the backend starts, then every `interval_seconds`
+   (default 300), or when the **Scan network** button is pressed, the backend
+   publishes a `discover` job to `cisco-commands`.
+2. The worker scans the subnets of the VM's own network interfaces (Docker
+   bridges and loopback are skipped) for hosts with port 22 open.
+3. It logs into each one with the credentials in `config/routers.json`
+   (`admin` / `cisco`) and reads the IOS prompt: `R1#` means that IP is R1.
+4. The list of routers found is published to `cisco-results`. The backend keeps
+   the latest list and shows it in the router drop-down.
+
+The worker runs with `network_mode: host` so it can see the VM's real
+interfaces, and so it reaches the routers the same way the VM does.
+
+Before running any job, the worker checks that the prompt shows the expected
+hostname. If DHCP has moved R1's old IP to R2, the job fails with
+"IPs changed, scan again" instead of running on the wrong router.
+
+Discovery only works when the routers are on a subnet the VM is directly
+attached to (for example a GNS3 Cloud node on the same VMware network). If
+they are elsewhere but routable, list the subnets to scan in
+`config/routers.json`:
+
+```json
+"discovery": { "subnets": ["192.168.50.0/24"], "interval_seconds": 300 }
+```
+
+Or skip discovery for a router by giving its IP directly. Entries in
+`"routers"` win over discovered ones with the same name:
+
+```json
+"routers": [ { "name": "R1", "host": "192.168.50.10" } ]
+```
+
+Discovery tries the lab credentials on every host with port 22 open in the
+scanned subnets. That is fine on a lab network; do not point it at a real one.
 
 ## Message flow
 
 1. The user picks a router, a mode, and commands in the web page.
-2. `POST /api/jobs` → the backend publishes a job to `cisco-commands`, keyed by
-   router name, and marks it `queued`.
+2. `POST /api/jobs` → the backend looks up the router's IP, publishes a job to
+   `cisco-commands`, keyed by router name, and marks it `queued`.
 3. A worker in the consumer group `cisco-workers` picks up the job and publishes
    `running` to `cisco-results`.
 4. The worker SSHes to the router, enters `enable` if needed, sets
@@ -71,13 +115,14 @@ run in order even when several workers are running.
 Job message (`cisco-commands`):
 
 ```json
-{"job_id": "a1b2c3d4e5f6", "router": "R1", "mode": "exec",
+{"job_id": "a1b2c3d4e5f6", "router": "R1", "host": "192.168.50.10", "mode": "exec",
  "commands": ["show ip interface brief"], "submitted_at": "2026-09-30T10:00:00+00:00"}
 ```
 
 Result message (`cisco-results`): the same fields, plus `status`
 (`running` / `success` / `failed`), `output`, `error`, `worker`,
-`started_at`, and `finished_at`.
+`started_at`, and `finished_at`. A finished `discover` job also carries
+`routers`: `[{"name": "R1", "host": "..."}, ...]`.
 
 ## Running on the Ubuntu server (VMware)
 
@@ -93,6 +138,11 @@ Suggested VM size: 2 vCPU, 4 GB RAM, 20 GB disk. Kafka alone uses about 1 GB.
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y ca-certificates curl git
 ```
+
+`apt upgrade` may open blue "Package configuration" screens, for example
+`keyboard-configuration` asking for a keyboard layout, or a list of services
+to restart. Press Enter to accept the defaults. The keyboard layout only
+affects typing on the VMware console, not SSH sessions.
 
 ### 2. Docker Engine and the compose plugin
 
@@ -129,7 +179,8 @@ cd cisco-kafka-project
 
 ### 4. Check the VM can reach the routers
 
-Get each router's address with `show ip interface brief` in GNS3, then from the VM:
+You do not need the router IPs in any file, but check the network once. Get a
+router's current address with `show ip interface brief` in GNS3, then from the VM:
 
 ```bash
 ping <R1-ip>
@@ -150,16 +201,7 @@ ssh -o KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1 \
     admin@<R1-ip>
 ```
 
-### 5. Point the config at the routers
-
-Edit `config/routers.json` and set `host` for R1 and R2 to the addresses from
-step 4. The file is read on every job, so later edits do not need a restart.
-
-```bash
-nano config/routers.json
-```
-
-### 6. Start the stack
+### 5. Start the stack
 
 ```bash
 docker compose up -d --build
@@ -168,11 +210,15 @@ docker compose ps          # kafka should be "healthy", kafka-init "Exited (0)"
 
 The first build downloads images and Python packages, which takes a few minutes.
 
-### 7. Test SSH from the worker, then open the web page
+### 6. Check discovery, then open the web page
 
 ```bash
-docker compose exec worker python cisco_ssh.py R1 "show ip interface brief"
+docker compose exec worker python discovery.py
 ```
+
+This prints the subnets scanned, the hosts with SSH open, and which router was
+found at which IP. It should end with something like
+`found 2 router(s): R1=..., R2=...`.
 
 Find the VM's IP with `ip -4 addr` and open `http://<vm-ip>:7000` from the
 Windows host. If `ufw` is active, open the ports first:
@@ -211,20 +257,22 @@ wr
 
 Do the same on R2 with `hostname R2`. Then:
 
-- Run `show ip interface brief` on each router and put the Fa0/0 address into
-  `host` in `config/routers.json`. The IPs in the repo are placeholders.
+- The hostname is how discovery tells the routers apart, so every router needs
+  a unique one. The username and password must match `config/routers.json`.
 - Fa0/0 gets its address from DHCP, so it can change after a router or GNS3
-  restart. If a job suddenly times out, check the IP again first.
+  restart. Press **Scan network** (or wait for the periodic scan) afterwards.
 - `privilege 15` makes the SSH session start at `R1#`, so no enable secret is
   needed. If a router ever lands at `R1>`, add `"enable_secret"` to that
   router's entry in `routers.json`.
 
 ## Testing and troubleshooting
 
-Test SSH to a router without Kafka, from inside the worker container:
+Test discovery and SSH without Kafka, from inside the worker container:
 
 ```bash
-docker compose exec worker python cisco_ssh.py R1 "show ip interface brief"
+docker compose exec worker python discovery.py                  # subnets from routers.json
+docker compose exec worker python discovery.py 192.168.50.0/24  # a specific subnet
+docker compose exec worker python cisco_ssh.py <router-ip> "show ip interface brief"
 ```
 
 Send a job with curl, without the web page:
@@ -234,6 +282,8 @@ curl -X POST http://localhost:7001/api/jobs \
   -H 'Content-Type: application/json' \
   -d '{"router": "R1", "mode": "exec", "commands": ["show ip interface brief"]}'
 curl http://localhost:7001/api/jobs
+curl -X POST http://localhost:7001/api/discover   # rescan
+curl http://localhost:7001/api/routers
 ```
 
 Logs:
@@ -243,6 +293,10 @@ docker compose logs -f worker backend
 ```
 
 - **Job stays `queued`:** no worker is consuming. Check `docker compose logs worker`.
+- **Router drop-down is empty:** open the "Network scan" job in the job list.
+  Its output shows which subnets were scanned and what each SSH host answered.
+  If the routers' subnet is missing, set `discovery.subnets` (see above).
+- **`IPs changed, scan again`:** DHCP moved the addresses. Press **Scan network**.
 - **`SSH connect ... failed`:** the container cannot reach the router, or the
   credentials are wrong. Run the `cisco_ssh.py` test above, and `ping` from the VM.
 - **SSH algorithm negotiation errors** (`Incompatible ssh peer`, `no acceptable

@@ -1,5 +1,8 @@
 """Backend API: accepts jobs from the frontend, publishes them to Kafka,
-and tracks their status from the results topic written by the worker."""
+and tracks their status from the results topic written by the worker.
+
+Router IPs are not configured: the worker discovers routers by hostname
+(a "discover" job) and the backend keeps the latest name -> IP table."""
 
 import json
 import logging
@@ -23,6 +26,8 @@ MAX_JOBS = 200
 MAX_COMMANDS = 50
 MODES = ("exec", "config")
 TERMINAL_STATUSES = ("success", "failed")
+DISCOVERY_ROUTER = "(scan)"
+FIRST_SCAN_DELAY = 5
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [backend] %(message)s")
 log = logging.getLogger(__name__)
@@ -32,10 +37,10 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_routers():
+def load_config():
     # Read on every call so edits to routers.json apply without a restart.
     with open(ROUTERS_FILE, encoding="utf-8") as f:
-        return json.load(f)["routers"]
+        return json.load(f)
 
 
 def connect_kafka(factory, what):
@@ -50,11 +55,13 @@ def connect_kafka(factory, what):
 
 
 class JobStore:
-    """In-memory job table. The results topic is replayed from the start on
-    boot, so finished jobs survive a backend restart."""
+    """In-memory job and router tables. The results topic is replayed from
+    the start on boot, so finished jobs and the last scan survive a restart."""
 
     def __init__(self):
         self._jobs = OrderedDict()
+        self._discovered = []
+        self._last_scan = None
         self._lock = threading.Lock()
 
     def add(self, job):
@@ -70,13 +77,17 @@ class JobStore:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
-                job = {k: event.get(k) for k in ("job_id", "router", "mode", "commands", "submitted_at")}
+                job = {k: event.get(k) for k in ("job_id", "router", "host", "mode", "commands", "submitted_at")}
                 self._jobs[job_id] = job
             if job.get("status") in TERMINAL_STATUSES and event.get("status") not in TERMINAL_STATUSES:
                 return
             for key in ("status", "output", "error", "worker", "started_at", "finished_at"):
                 if key in event:
                     job[key] = event[key]
+            if job.get("mode") == "discover":
+                self._last_scan = job
+                if event.get("status") == "success" and "routers" in event:
+                    self._discovered = event["routers"]
 
     def get(self, job_id):
         with self._lock:
@@ -86,6 +97,14 @@ class JobStore:
     def list(self):
         with self._lock:
             return [dict(j) for j in reversed(self._jobs.values())]
+
+    def discovered(self):
+        with self._lock:
+            return list(self._discovered)
+
+    def last_scan(self):
+        with self._lock:
+            return dict(self._last_scan) if self._last_scan else None
 
 
 jobs = JobStore()
@@ -97,6 +116,48 @@ producer = connect_kafka(
     ),
     "producer",
 )
+
+
+def known_routers():
+    """Discovered routers, with entries from routers.json taking priority
+    for the same name (a manual fallback when discovery cannot reach them)."""
+    routers = {r["name"]: {**r, "source": "discovered"} for r in jobs.discovered()}
+    for r in load_config().get("routers", []):
+        if r.get("name") and r.get("host"):
+            routers[r["name"]] = {"name": r["name"], "host": r["host"], "source": "config"}
+    return sorted(routers.values(), key=lambda r: r["name"])
+
+
+def publish_job(router, mode, commands=None, host=None):
+    job = {
+        "job_id": uuid.uuid4().hex[:12],
+        "router": router,
+        "host": host,
+        "mode": mode,
+        "commands": commands or [],
+        "submitted_at": now_iso(),
+    }
+    # Store before sending: a fast worker's "running" event must not arrive
+    # for a job we have not recorded yet and then be overwritten by "queued".
+    jobs.add({**job, "status": "queued"})
+    try:
+        # Keyed by router so every job for one router lands on the same
+        # partition and runs in submission order, even with several workers.
+        producer.send(COMMAND_TOPIC, key=router, value=job).get(timeout=10)
+    except Exception as exc:
+        log.exception("failed to publish job %s", job["job_id"])
+        jobs.apply_event({"job_id": job["job_id"], "status": "failed", "error": f"Kafka publish failed: {exc}"})
+    else:
+        log.info("queued job %s for %s (%s): %s", job["job_id"], router, mode, job["commands"])
+    return jobs.get(job["job_id"])
+
+
+def request_scan():
+    """Queue a discovery job unless one is already waiting or running."""
+    last = jobs.last_scan()
+    if last and last.get("status") not in TERMINAL_STATUSES:
+        return last
+    return publish_job(DISCOVERY_ROUTER, "discover")
 
 
 def consume_results():
@@ -119,7 +180,25 @@ def consume_results():
             time.sleep(1)
 
 
+def scan_periodically():
+    """Scan once at startup, then every interval_seconds (0 = startup only;
+    the setting is re-read each minute so it can be changed live)."""
+    time.sleep(FIRST_SCAN_DELAY)
+    first = True
+    while True:
+        interval = 0
+        try:
+            interval = int(load_config().get("discovery", {}).get("interval_seconds", 300))
+            if first or interval > 0:
+                request_scan()
+        except Exception:
+            log.exception("periodic scan failed")
+        first = False
+        time.sleep(interval if interval > 0 else 60)
+
+
 threading.Thread(target=consume_results, daemon=True, name="results-consumer").start()
+threading.Thread(target=scan_periodically, daemon=True, name="periodic-scan").start()
 
 app = Flask(__name__)
 
@@ -131,11 +210,13 @@ def health():
 
 @app.get("/api/routers")
 def list_routers():
-    routers = [
-        {"name": r["name"], "host": r["host"], "description": r.get("description", "")}
-        for r in load_routers()
-    ]
-    return jsonify(routers)
+    return jsonify({"routers": known_routers(), "last_scan": jobs.last_scan()})
+
+
+@app.post("/api/discover")
+def discover():
+    job = request_scan()
+    return jsonify(job), 503 if job.get("status") == "failed" else 202
 
 
 @app.get("/api/jobs")
@@ -161,8 +242,9 @@ def create_job():
         commands = commands.splitlines()
     commands = [c.strip() for c in commands if isinstance(c, str) and c.strip()]
 
-    if router not in {r["name"] for r in load_routers()}:
-        return jsonify({"error": f"unknown router: {router!r}"}), 400
+    host = next((r["host"] for r in known_routers() if r["name"] == router), None)
+    if host is None:
+        return jsonify({"error": f"unknown router {router!r}: scan the network first"}), 400
     if mode not in MODES:
         return jsonify({"error": f"mode must be one of {MODES}"}), 400
     if not commands:
@@ -170,24 +252,5 @@ def create_job():
     if len(commands) > MAX_COMMANDS:
         return jsonify({"error": f"at most {MAX_COMMANDS} commands per job"}), 400
 
-    job = {
-        "job_id": uuid.uuid4().hex[:12],
-        "router": router,
-        "mode": mode,
-        "commands": commands,
-        "submitted_at": now_iso(),
-    }
-    # Store before sending: a fast worker's "running" event must not arrive
-    # for a job we have not recorded yet and then be overwritten by "queued".
-    jobs.add({**job, "status": "queued"})
-    try:
-        # Keyed by router so every job for one router lands on the same
-        # partition and runs in submission order, even with several workers.
-        producer.send(COMMAND_TOPIC, key=router, value=job).get(timeout=10)
-    except Exception as exc:
-        log.exception("failed to publish job %s", job["job_id"])
-        jobs.apply_event({"job_id": job["job_id"], "status": "failed", "error": f"Kafka publish failed: {exc}"})
-        return jsonify(jobs.get(job["job_id"])), 503
-
-    log.info("queued job %s for %s: %s", job["job_id"], router, commands)
-    return jsonify(jobs.get(job["job_id"])), 202
+    job = publish_job(router, mode, commands, host)
+    return jsonify(job), 503 if job.get("status") == "failed" else 202
