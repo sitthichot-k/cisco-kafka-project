@@ -191,15 +191,18 @@ If `ping` fails, fix the GNS3 / VMware network first. The containers reach the
 routers through the VM's own routing, so if the VM cannot reach them, the
 worker cannot either.
 
-If `ping` works but `ssh` fails with `no matching key exchange method` or
-`no matching host key type`, the router only offers old algorithms. For a
-manual test, allow them explicitly:
+If `ssh` fails with `no matching key exchange method found`, the network is
+fine: the router answered, but it only offers SHA1 key exchange
+(`diffie-hellman-group-exchange-sha1`, `group14-sha1`, `group1-sha1`), which
+current OpenSSH on Ubuntu disables. For a manual test, allow them explicitly:
 
 ```bash
-ssh -o KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1 \
-    -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
-    admin@<R1-ip>
+ssh -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa admin@<R1-ip>
+# if it then says "no matching cipher found", also add: -o Ciphers=+aes128-cbc
 ```
+
+The worker does not need this. paramiko 3.5.x, pinned by `paramiko<4`, enables
+all three SHA1 key exchanges, `ssh-rsa`, and the CBC ciphers by default.
 
 ### 5. Start the stack
 
